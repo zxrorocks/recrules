@@ -46,47 +46,57 @@ if ($foundProfiles.Count -gt 0) {
 }
 
 try {
-    $ciEnabled = Get-ItemPropertyValue "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity" -Name "Enabled" -ErrorAction Stop
+    $restartPendingWU = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
+    $restartPendingCI = $false
+    try {
+        $rebootRequiredValue = $null
+        try {
+            $rebootRequiredValue = Get-ItemPropertyValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity" -Name "RebootRequired" -ErrorAction Stop
+        } catch {}
+        if ($rebootRequiredValue -eq 1) {
+            $restartPendingCI = $true
+        }
+    } catch {}
+    $restartPending = $restartPendingWU -or $restartPendingCI
+    $vbsStatus = $null
+    try {
+        $vbsStatus = (Get-CimInstance -Namespace 'Root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard).VirtualizationBasedSecurityStatus
+    } catch {}
     $outputMessages += "Memory integrity available"
-    $outputMessages += if ($ciEnabled -eq 1) { "Memory Integrity Is On" } else { "Memory Integrity Is Off" }
+    if ($vbsStatus -eq 2) {
+        if ($restartPending) {
+            $outputMessages += "Memory Integrity is ON but a restart is required for it to be fully enabled"
+        } else {
+            $outputMessages += "Memory Integrity is enabled."
+        }
+    } else {
+        $outputMessages += "Memory Integrity is disabled."
+    }
+    # Insert exclusion header right after memory integrity section
+    $outputMessages += "<EXCLUSION_HEADER_PLACEHOLDER>"
 } catch {
     $outputMessages += "Memory Integrity status unknown"
+    # Insert exclusion header even if memory integrity check fails
+    $outputMessages += "<EXCLUSION_HEADER_PLACEHOLDER>"
 }
 
-try {
-    $threats = Get-MpThreat | Where-Object { $_.IsActive }
-    if ($threats) {
-        $outputMessages += "Allowed threats detected:"
-        $outputMessages += $threats | ForEach-Object { "    $($_.ThreatName)" }
-    } else {
-        $outputMessages += "No allowed threats found"
-    }
-} catch {
-    $outputMessages += "Could not check for allowed threats"
-}
-
+# Collect exclusion paths separately
+$exclusionBlock = @()
+$exclusionHeader = "No exclusions found"
 try {
     $exclusions = (Get-MpPreference).ExclusionPath
     if ($exclusions) {
-        $outputMessages += "Exclusion paths detected:"
-        $outputMessages += $exclusions | ForEach-Object { "    $_" }
-    } else {
-        $outputMessages += "No exclusions found"
+        # Remove duplicate exclusion paths and filter out empty/null
+        $uniqueExclusions = $exclusions | Where-Object { $_ } | Sort-Object -Unique
+        if ($uniqueExclusions.Count -gt 0) {
+            $exclusionHeader = "Exclusion paths detected:"
+            foreach ($excl in $uniqueExclusions) {
+                $exclusionBlock += "    $excl"
+            }
+        }
     }
 } catch {
-    $outputMessages += "Could not get exclusion paths"
-}
-
-try {
-    $tempExclusions = (Get-MpPreference).ExclusionProcess
-    if ($tempExclusions) {
-        $outputMessages += "Temporary exclusions detected:"
-        $outputMessages += $tempExclusions | ForEach-Object { "    $_" }
-    } else {
-        $outputMessages += "No temporary exclusions found"
-    }
-} catch {
-    $outputMessages += "Could not get temporary exclusions"
+    $exclusionBlock = @("Could not get exclusion paths")
 }
 
 try {
@@ -95,7 +105,7 @@ try {
         if (-not $defender.RealTimeProtectionEnabled) {
             try {
                 Set-MpPreference -DisableRealtimeMonitoring $false
-                $outputMessages += "Realtime protection was OFF and is now being enabled"
+                $outputMessages += "Realtime protection is OFF"
             } catch {
                 $outputMessages += "Could not enable realtime protection"
             }
@@ -110,17 +120,53 @@ try {
 }
 
 try {
-    $isWindows = ($env:OS -eq "Windows_NT" -and (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop))
-    $outputMessages += if ($isWindows) { "User isn't on a VM" } else { "System might be virtualized" }
+    $isWinOS = ($env:OS -eq "Windows_NT" -and (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop))
+    $outputMessages += if ($isWinOS) { "User isn't on a VM" } else { "System might be virtualized" }
 } catch {
     $outputMessages += "System might be virtualized"
 }
 
 $outputMessages += "Powershell Passed"
+# Do NOT add $exclusionBlock to $outputMessages here
 
-$outputMessagesSorted = $outputMessages | Sort-Object
+# For scoring, always add exclusions to $scoredOutput if any exist
+$scoredOutput = $outputMessages | Where-Object {
+    $_ -notlike "*PowerShell profile*" -and
+    $_ -notlike "No allowed threats found*" -and
+    $_ -ne '<EXCLUSION_HEADER_PLACEHOLDER>' -and
+    $_ -ne 'Exclusions found' -and
+    $_ -ne 'No exclusions found.'
+}
+if ($exclusionBlock.Count -gt 0) {
+    $scoredOutput += $exclusionBlock
+}
+$totalChecks = $scoredOutput.Count
+$passedChecks = ($scoredOutput | Where-Object {
+    $_ -like "*Passed" -or
+    $_ -like "*ENABLED" -or
+    $_ -like "*On" -or
+    $_ -like "No * found" -or
+    $_ -like "*isn't on a VM" -or
+    $_ -like "Memory integrity available" -or
+    $_ -like "Memory Integrity is enabled."
+}).Count
+$successRate = if ($profilesFound) { $null } elseif ($totalChecks -gt 0) { [math]::Round(($passedChecks / $totalChecks) * 100, 2) } else { 0 }
+$status = if (100 -eq $successRate) { "Passed" } elseif ($null -ne $successRate) { "Failed" } else { "Skipped" }
+
+# Do not sort, just remove duplicates and empty lines, preserving order
+$outputMessagesSorted = $outputMessages | Where-Object { $_ -ne '' } | Select-Object -Unique
+# When printing output, replace placeholder with correct header and color
+$exclusionHeaderPrinted = $false
 foreach ($line in $outputMessagesSorted) {
-    if ($line -match 'Disabled|Off|Failed|threats detected|Could not') {
+    if ($line -eq '<EXCLUSION_HEADER_PLACEHOLDER>') {
+        if ($exclusionBlock.Count -gt 0) {
+            Write-Host "Exclusions found" -ForegroundColor Red
+        } else {
+            Write-Host "No exclusions found." -ForegroundColor Green
+        }
+    } elseif ($line -eq 'Memory Integrity is ON but a restart is required for it to be fully enabled') {
+        Write-Host $line -ForegroundColor Red
+    } elseif ($line -match 'Disabled|Off|Failed|threats detected|Could not|Allowed threats detected') {
         Write-Host $line -ForegroundColor Red
     } else {
         Write-Host $line -ForegroundColor Green
@@ -138,21 +184,6 @@ try {
     Write-Host "Could not enumerate active users." -ForegroundColor White
 }
 
-$scoredOutput = $outputMessages | Where-Object {
-    $_ -notlike "*PowerShell profile*"
-}
-$totalChecks = $scoredOutput.Count
-$passedChecks = ($scoredOutput | Where-Object {
-    $_ -like "*Passed" -or
-    $_ -like "*ENABLED" -or
-    $_ -like "*On" -or
-    $_ -like "No * found" -or
-    $_ -like "*isn't on a VM" -or
-    $_ -like "Memory integrity available"
-}).Count
-$successRate = if ($profilesFound) { $null } elseif ($totalChecks -gt 0) { [math]::Round(($passedChecks / $totalChecks) * 100, 2) } else { 0 }
-$status = if ($successRate -eq 100) { "Passed" } elseif ($successRate -ne $null) { "Failed" } else { "Skipped" }
-
 if ($successRate -ne $null) {
     if ($status -eq "Passed") {
         Write-Host "`n$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $successRate% $status" -ForegroundColor Green
@@ -165,18 +196,44 @@ if ($successRate -ne $null) {
     Write-Host "`nSuccess rate skipped due to PowerShell profile presence." -ForegroundColor Red
 }
 
-if ($status -eq "Failed") {
-    Write-Host "`nReasons for failure:" -ForegroundColor White
-    $scoredOutput | Where-Object {
-        $_ -notlike "*Passed" -and
-        $_ -notlike "*ENABLED" -and
-        $_ -notlike "*On" -and
-        $_ -notlike "No * found" -and
-        $_ -notlike "*isn't on a VM" -and
-        $_ -notlike "Memory integrity available"
-    } | ForEach-Object { Write-Host " - $_" -ForegroundColor Red }
+# Only display exclusions if there are any, otherwise print nothing
+if ($exclusionBlock.Count -gt 0) {
+    Write-Host ""  # Add a blank line before exclusions
+    Write-Host "Exclusions found" -ForegroundColor Red
+    foreach ($excl in $exclusionBlock) {
+        Write-Host $excl -ForegroundColor Red
+    }
 }
 
+Write-Host "`nAll Threat Logs (Allowed isnt consistant):" -ForegroundColor White
+try {
+    Get-WinEvent -LogName "Microsoft-Windows-Windows Defender/Operational" -FilterXPath "*[System[(EventID=1117)]]" |
+    Sort-Object TimeCreated -Descending |
+    ForEach-Object {
+        $msg = $_.Message -replace "`r", "" -split "`n"
+
+        $threat = ($msg | Where-Object { $_ -match "^\s*Name:" }) -replace ".*?:", "" -replace "^\s+", ""
+        $action = ($msg | Where-Object { $_ -match "^\s*Action:" }) -replace ".*?:", "" -replace "^\s+", ""
+        $rawPath = ($msg | Where-Object { $_ -match "^\s*Path:" }) -replace ".*?:", "" -replace "^file:_+|^containerfile:_+", ""
+        $cleanPath = $rawPath.Trim('"').Trim()
+
+        # If Defender says Quarantine, but file still exists ? assume it was Allowed
+        $isValidPath = $cleanPath -and ($cleanPath -notmatch '[<>:"|?*]')
+        if ($action -eq "Quarantine" -and $isValidPath -and (Test-Path $cleanPath)) {
+            $finalStatus = "Allowed (manually)"
+        } else {
+            $finalStatus = $action
+        }
+
+        [PSCustomObject]@{
+            ThreatName = $threat
+            Status     = $finalStatus
+            Path       = $cleanPath
+        }
+    } | Sort-Object ThreatName | Format-Table -AutoSize
+} catch {
+    Write-Host "Could not enumerate allowed threat logs." -ForegroundColor White
+}
 Write-Host "`nPress Enter for step 2" -ForegroundColor Green
 Read-Host | Out-Null
 
