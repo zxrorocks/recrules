@@ -1,3 +1,7 @@
+# This is full chat gptd and would be better if it was obfuscated so bypasses dont come out (but since ppl said it was a rat im forced to release the code)
+# credits to raven for step 2
+# also some of the code here does nothing i cba to remove it so figure it out if you wanna bypass :wink:
+
 if (-not $env:STEP1_LAUNCHED) {
     $tempScript = "$env:TEMP\_step1_main.ps1"
     $thisScript = Get-Content -Raw -Path $MyInvocation.MyCommand.Path
@@ -72,21 +76,17 @@ try {
     } else {
         $outputMessages += "Memory Integrity is disabled."
     }
-    # Insert exclusion header right after memory integrity section
     $outputMessages += "<EXCLUSION_HEADER_PLACEHOLDER>"
 } catch {
     $outputMessages += "Memory Integrity status unknown"
-    # Insert exclusion header even if memory integrity check fails
     $outputMessages += "<EXCLUSION_HEADER_PLACEHOLDER>"
 }
 
-# Collect exclusion paths separately
 $exclusionBlock = @()
 $exclusionHeader = "No exclusions found"
 try {
     $exclusions = (Get-MpPreference).ExclusionPath
     if ($exclusions) {
-        # Remove duplicate exclusion paths and filter out empty/null
         $uniqueExclusions = $exclusions | Where-Object { $_ } | Sort-Object -Unique
         if ($uniqueExclusions.Count -gt 0) {
             $exclusionHeader = "Exclusion paths detected:"
@@ -127,9 +127,7 @@ try {
 }
 
 $outputMessages += "Powershell Passed"
-# Do NOT add $exclusionBlock to $outputMessages here
 
-# For scoring, always add exclusions to $scoredOutput if any exist
 $scoredOutput = $outputMessages | Where-Object {
     $_ -notlike "*PowerShell profile*" -and
     $_ -notlike "No allowed threats found*" -and
@@ -153,9 +151,7 @@ $passedChecks = ($scoredOutput | Where-Object {
 $successRate = if ($profilesFound) { $null } elseif ($totalChecks -gt 0) { [math]::Round(($passedChecks / $totalChecks) * 100, 2) } else { 0 }
 $status = if (100 -eq $successRate) { "Passed" } elseif ($null -ne $successRate) { "Failed" } else { "Skipped" }
 
-# Do not sort, just remove duplicates and empty lines, preserving order
 $outputMessagesSorted = $outputMessages | Where-Object { $_ -ne '' } | Select-Object -Unique
-# When printing output, replace placeholder with correct header and color
 $exclusionHeaderPrinted = $false
 foreach ($line in $outputMessagesSorted) {
     if ($line -eq '<EXCLUSION_HEADER_PLACEHOLDER>') {
@@ -196,9 +192,8 @@ if ($successRate -ne $null) {
     Write-Host "`nSuccess rate skipped due to PowerShell profile presence." -ForegroundColor Red
 }
 
-# Only display exclusions if there are any, otherwise print nothing
 if ($exclusionBlock.Count -gt 0) {
-    Write-Host ""  # Add a blank line before exclusions
+    Write-Host "" 
     Write-Host "Exclusions found" -ForegroundColor Red
     foreach ($excl in $exclusionBlock) {
         Write-Host $excl -ForegroundColor Red
@@ -217,7 +212,6 @@ try {
         $rawPath = ($msg | Where-Object { $_ -match "^\s*Path:" }) -replace ".*?:", "" -replace "^file:_+|^containerfile:_+", ""
         $cleanPath = $rawPath.Trim('"').Trim()
 
-        # If Defender says Quarantine, but file still exists ? assume it was Allowed
         $isValidPath = $cleanPath -and ($cleanPath -notmatch '[<>:"|?*]')
         if ($action -eq "Quarantine" -and $isValidPath -and (Test-Path $cleanPath)) {
             $finalStatus = "Allowed (manually)"
@@ -237,7 +231,6 @@ try {
 Write-Host "`nPress Enter for step 2" -ForegroundColor Green
 Read-Host | Out-Null
 
-# Step 2: Run a.ps1 logic in a new elevated window
 $aScript = @'
 function Ensure-Admin {
     $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
